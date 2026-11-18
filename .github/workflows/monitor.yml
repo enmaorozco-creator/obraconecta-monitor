@@ -1,0 +1,89 @@
+# Monitor de caídas de ObraConecta HMO (gratuito: repositorio público con GitHub Actions).
+# Cada 5 minutos revisa la app, la página y el demo. Si algo falla 2 veces seguidas abre un "issue"
+# (GitHub te avisa por correo y en la app de GitHub); cuando vuelve, lo comenta y lo cierra.
+name: Monitor
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # GitHub puede retrasarlo unos minutos en horas de mucha carga
+    - cron: "0 15 1 * *"    # mantener vivo: GitHub apaga los cron tras 60 días sin actividad
+  workflow_dispatch:
+    inputs:
+      simular_caida:
+        description: "Simular una caída para probar el aviso"
+        type: boolean
+        default: false
+
+permissions:
+  issues: write
+  contents: write
+
+concurrency: monitor
+
+jobs:
+  revisar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      AVISAR_A: "@enmaorozco-creator"
+    steps:
+      - name: Revisar sitios
+        id: revisar
+        run: |
+          # URL | texto que debe aparecer en la respuesta
+          SITIOS="https://app.obraconecta.mx/api/salud|\"ok\": true
+          https://app.obraconecta.mx/|/app.js
+          https://obraconecta.mx/|ObraConecta
+          https://demo.obraconecta.mx/api/salud|\"ok\": true"
+          if [ "${{ inputs.simular_caida }}" = "true" ]; then
+            SITIOS="$SITIOS
+          https://app.obraconecta.mx/no-existe-prueba-monitor|texto-que-no-existe"
+          fi
+          fallas=""
+          while IFS='|' read -r url esperado; do
+            url="$(echo "$url" | xargs)"
+            ok=0
+            for intento in 1 2; do   # dos intentos: evita avisos por un parpadeo de red
+              cuerpo="$(curl -fsS --max-time 20 -A 'ObraConecta-Monitor' "$url" 2>/dev/null || true)"
+              if printf '%s' "$cuerpo" | grep -qF "$esperado"; then ok=1; break; fi
+              sleep 20
+            done
+            if [ $ok = 1 ]; then echo "OK    $url"; else echo "FALLA $url"; fallas="$fallas- $url"$'\n'; fi
+          done <<< "$SITIOS"
+          {
+            echo "fallas<<FIN"
+            printf '%s' "$fallas"
+            echo "FIN"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Avisar o cerrar aviso
+        env:
+          FALLAS: ${{ steps.revisar.outputs.fallas }}
+        run: |
+          gh label create caida --color B60205 --description "Sitio caído" -R "$GITHUB_REPOSITORY" 2>/dev/null || true
+          abierto="$(gh issue list -R "$GITHUB_REPOSITORY" --label caida --state open --json number -q '.[0].number')"
+          hora="$(TZ=America/Hermosillo date '+%d/%m/%Y %H:%M')"
+          if [ -n "$FALLAS" ] && [ -z "$abierto" ]; then
+            gh issue create -R "$GITHUB_REPOSITORY" --label caida \
+              --title "🔴 ObraConecta caído ($hora, hora de Hermosillo)" \
+              --body "$AVISAR_A No responden desde las $hora (hora de Hermosillo):
+
+          $FALLAS
+          Qué revisar: \`systemctl status obraconecta caddy\` en el servidor. Este aviso se cierra solo cuando todo vuelva."
+          elif [ -z "$FALLAS" ] && [ -n "$abierto" ]; then
+            gh issue comment "$abierto" -R "$GITHUB_REPOSITORY" --body "🟢 Todo responde de nuevo ($hora, hora de Hermosillo)."
+            gh issue close "$abierto" -R "$GITHUB_REPOSITORY"
+          fi
+
+  mantener-vivo:
+    if: github.event.schedule == '0 15 1 * *'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          git config user.name "monitor"
+          git config user.email "monitor@users.noreply.github.com"
+          date -u +%F > ultima-revision.txt
+          git add ultima-revision.txt
+          git commit -m "Mantener vivo el monitor" && git push
